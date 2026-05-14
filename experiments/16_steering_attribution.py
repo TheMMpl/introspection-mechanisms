@@ -79,7 +79,7 @@ DEFAULT_TRACE_DEPTH = 2
 DEFAULT_MAX_PER_TYPE = [8, 5, 3, 2]  # Per-hop: progressively narrower
 DEFAULT_FRAC_OF_MAX = 0.10
 DEFAULT_TOKEN_POS = -1
-DEFAULT_VECTORS_DIR = "analysis/02b_steering_500_concepts"
+DEFAULT_VECTORS_DIR = "analysis/02_steering_evaluation"
 DEFAULT_OUTPUT_DIR = "analysis/16_steering_attribution"
 DEFAULT_DEVICE = "cuda"
 DEFAULT_DTYPE = "bfloat16"
@@ -188,8 +188,19 @@ class JumpReLUSAE(nn.Module):
         return recon
 
 
-# CPU cache for loaded SAEs
+# CPU cache for loaded SAEs. Disabled by default to limit CPU memory: with
+# 262k-width SAEs across many layers (4 types each) the cache would otherwise
+# accumulate to hundreds of GB. Toggle via `set_sae_cpu_cache(True)` if needed.
 _sae_cpu_cache: Dict[str, JumpReLUSAE] = {}
+_USE_SAE_CPU_CACHE = False
+
+
+def set_sae_cpu_cache(enabled: bool) -> None:
+    """Enable/disable retention of loaded SAEs in CPU RAM across calls."""
+    global _USE_SAE_CPU_CACHE
+    _USE_SAE_CPU_CACHE = enabled
+    if not enabled:
+        _sae_cpu_cache.clear()
 
 
 def load_sae(
@@ -221,7 +232,7 @@ def load_sae(
     from safetensors.torch import load_file
 
     cache_key = f"{model_size}_{sae_type}_L{layer_idx}_{width}_{l0}_{'it' if instruction_tuned else 'pt'}"
-    if cache_key in _sae_cpu_cache:
+    if _USE_SAE_CPU_CACHE and cache_key in _sae_cpu_cache:
         sae = _sae_cpu_cache[cache_key]
         return sae.to(device=device, dtype=dtype)
 
@@ -249,7 +260,8 @@ def load_sae(
     if is_transcoder and "affine_skip_connection" in params:
         sae.affine_skip_connection.data = params["affine_skip_connection"]
 
-    _sae_cpu_cache[cache_key] = sae.cpu().float()
+    if _USE_SAE_CPU_CACHE:
+        _sae_cpu_cache[cache_key] = sae.cpu().float()
     return sae.to(device=device, dtype=dtype)
 
 
@@ -311,12 +323,18 @@ class ActivationHooks:
                     module = getattr(module, p, None)
                     if module is None:
                         break
-                if module is not None:
+                # If submodule path didn't resolve (e.g. ct="output"), hook the layer itself.
+                # Use just "layer_{li}" as the name so _create_hook stores output at
+                # "layer_{li}.output" (matching the lookup key used in extract_logit_lens).
+                if module is None:
+                    module = layer
+                    name = f"layer_{li}"
+                else:
                     name = f"layer_{li}.{ct}"
-                    h = module.register_forward_hook(
-                        self._create_hook(name, capture_input=True, capture_output=True)
-                    )
-                    self.hooks.append(h)
+                h = module.register_forward_hook(
+                    self._create_hook(name, capture_input=True, capture_output=True)
+                )
+                self.hooks.append(h)
 
     def remove_hooks(self):
         for h in self.hooks:
@@ -483,8 +501,13 @@ def extract_logit_lens(
 
     # Get norm and unembedding
     mdl = inner
-    if hasattr(mdl, "language_model"):
+    if hasattr(mdl, "language_model") and hasattr(mdl.language_model, "norm"):
         norm_fn = mdl.language_model.norm
+        unemb = mdl.lm_head.weight if hasattr(mdl, "lm_head") else None
+    elif (hasattr(mdl, "model") and hasattr(mdl.model, "language_model")
+          and hasattr(mdl.model.language_model, "norm")):
+        # Gemma3ForConditionalGeneration: model.language_model.norm
+        norm_fn = mdl.model.language_model.norm
         unemb = mdl.lm_head.weight if hasattr(mdl, "lm_head") else None
     elif hasattr(mdl, "model") and hasattr(mdl.model, "norm"):
         norm_fn = mdl.model.norm
@@ -887,23 +910,59 @@ class AdditiveLayerCut:
         return (layer_idx > injection_layer) or (layer_idx == injection_layer and sae_type == "resid_post_all")
 
 
+class LazySAECache:
+    """Dict-like lazy SAE handle.
+
+    Loads each `(layer_idx, sae_type)` SAE on demand (one at a time) so that
+    only the SAE currently in use occupies memory. The previous implementation
+    pre-loaded every SAE into CPU RAM which is infeasible at 262k width.
+
+    Supports the subset of dict operations used by combine routines:
+      - `key in cache` / iteration / generator expressions over keys
+      - `cache[(layer, sae_type)]` returns a freshly-loaded CPU SAE
+    """
+
+    def __init__(self, model_name: str, sae_width: str, sae_l0: str,
+                 layer_indices: List[int], sae_types: Set[str]):
+        self.model_name = model_name
+        self.model_size = _model_name_to_sae_size(model_name)
+        self.sae_width = sae_width
+        self.sae_l0 = sae_l0
+        self._keys: Set[Tuple[int, str]] = {
+            (li, st) for li in layer_indices for st in sae_types
+        }
+
+    def __contains__(self, key) -> bool:
+        return key in self._keys
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __getitem__(self, key: Tuple[int, str]) -> JumpReLUSAE:
+        if key not in self._keys:
+            raise KeyError(key)
+        li, st = key
+        sae = load_sae(li, self.sae_width, self.sae_l0, st,
+                       self.model_size, True, "cpu", torch.float32)
+        return sae.eval()
+
+
 def preload_saes(
     n_layers: int, model_name: str, sae_width: str, sae_l0: str,
     device: str = "cpu", layer_indices: Optional[set] = None,
-) -> Dict[Tuple[int, str], JumpReLUSAE]:
-    """Preload SAEs to the given device. Returns dict of (layer_idx, sae_type) -> sae."""
-    model_size = _model_name_to_sae_size(model_name)
+) -> "LazySAECache":
+    """Return a lazy SAE handle that loads SAEs one at a time on access.
+
+    The `device` argument is accepted for backward compatibility but ignored;
+    SAEs are materialized fresh on each access (combine routines move them to
+    GPU explicitly and release them after use).
+    """
     unique_types = set(SAE_TYPE_LOAD_MAP.get(st, st) for st in SAE_TYPES)
-    sae_cache: Dict[Tuple[int, str], JumpReLUSAE] = {}
-    layers_to_load = sorted(layer_indices) if layer_indices is not None else range(n_layers)
-    for li in tqdm(layers_to_load, desc="Preloading SAEs", leave=False):
-        for st in unique_types:
-            try:
-                sae = load_sae(li, sae_width, sae_l0, st, model_size, True, device)
-                sae_cache[(li, st)] = sae.eval()
-            except Exception:
-                pass
-    return sae_cache
+    layers_to_load = sorted(layer_indices) if layer_indices is not None else list(range(n_layers))
+    return LazySAECache(model_name, sae_width, sae_l0, layers_to_load, unique_types)
 
 
 # ── GA computation (Pass 1: forward + backward) ─────────────────────────────
@@ -922,6 +981,24 @@ def compute_ga_pass(
     layers_module = get_layers(model_inner)
     hook_layers = sorted(layer_indices) if layer_indices is not None else list(range(n_layers))
 
+    # Freeze model parameters so backward() does NOT allocate per-parameter
+    # .grad buffers (~54 GB for Gemma-3-27B in bf16 — the dominant OOM source).
+    # We only need gradients w.r.t. captured activations (retain_grad=True).
+    # To keep autograd alive without param grads, a forward pre-hook on
+    # layers[0] re-enables requires_grad on the residual stream so the rest of
+    # the network produces grad-tracked tensors.
+    saved_requires_grad = [(p, p.requires_grad) for p in model_inner.parameters()]
+    for p, _ in saved_requires_grad:
+        p.requires_grad_(False)
+
+    def _enable_grad_pre_hook(module, args, kwargs):
+        if args and isinstance(args[0], torch.Tensor) and args[0].is_floating_point():
+            h = args[0].detach().requires_grad_(True)
+            args = (h,) + args[1:]
+        return args, kwargs
+
+    grad_enable_handle = layers_module[0].register_forward_pre_hook(
+        _enable_grad_pre_hook, with_kwargs=True)
     steer_handle = layers_module[injection_layer].register_forward_hook(steering_hook_factory(strength))
     act_hooks = ActivationHooks(model_inner, retain_grad=True)
     act_hooks.register_hooks(layer_indices=hook_layers, capture_types=list(CAPTURE_TYPES_SAE))
@@ -931,13 +1008,17 @@ def compute_ga_pass(
             model_inner.eval()
             outputs = model_inner(input_ids=input_ids, attention_mask=attention_mask,
                                   output_hidden_states=False, return_dict=True)
+
+        raw_activations = act_hooks.get_activations()
+        loss = loss_fn(outputs, raw_activations)
+        loss.sum().backward()
     finally:
         steer_handle.remove()
+        grad_enable_handle.remove()
         act_hooks.remove_hooks()
-
-    raw_activations = act_hooks.get_activations()
-    loss = loss_fn(outputs, raw_activations)
-    loss.sum().backward()
+        # Restore original requires_grad state.
+        for p, rg in saved_requires_grad:
+            p.requires_grad_(rg)
 
     grad_data: Dict[Tuple[int, str], torch.Tensor] = {}
     act_data: Dict[Tuple[int, str], torch.Tensor] = {}
@@ -1145,18 +1226,24 @@ def combine_ga_sg_to_sa(
 
                 grad_tensor = grad_data[(li, st)].to(device)
                 x_all = act_data[(li, st)].to(device)
-                sae = sae_cache[(li, load_type)].to(device=device, dtype=torch.float32).eval()
-                w_enc, w_dec = sae.w_enc, sae.w_dec
+                # Load SAE in bf16 to fit alongside the model on a single GPU:
+                # at width=262k an fp32 SAE is ~11 GB; bf16 halves that. Active
+                # feature rows are upcast to fp32 below for the actual SA math.
+                sae = sae_cache[(li, load_type)].to(device=device, dtype=torch.bfloat16).eval()
 
-                sae_acts = sae.encode(x_all)
+                sae_acts = sae.encode(x_all.to(torch.bfloat16)).float()
                 tok_idx, feat_idx = (sae_acts > 0).nonzero(as_tuple=True)
                 n_active = len(tok_idx)
                 active_acts = sae_acts[tok_idx, feat_idx] if n_active > 0 else torch.tensor([])
 
+                # Upcast only the gathered (sparse) rows of w_dec / w_enc to fp32.
+                w_dec_active = sae.w_dec[feat_idx].float() if n_active > 0 else None
+                w_enc_active = sae.w_enc[:, feat_idx].float() if n_active > 0 else None
+
                 ga_vals = torch.zeros(n_active, device=device)
                 sg_vals = torch.zeros(n_active, device=device)
                 if n_active > 0:
-                    ga_vals = (grad_tensor[tok_idx] * w_dec[feat_idx]).sum(dim=-1)
+                    ga_vals = (grad_tensor[tok_idx] * w_dec_active).sum(dim=-1)
 
                 has_gp = cut_strategy.has_grad_path(li, st, injection_layer)
                 if has_gp and n_active > 0:
@@ -1165,7 +1252,7 @@ def combine_ga_sg_to_sa(
                         dx = tangent_data[tkey].to(device).float()
                         if dx.dim() == 3:
                             dx = dx[0]
-                        sg_vals = (dx[tok_idx] * w_enc[:, feat_idx].T).sum(dim=-1)
+                        sg_vals = (dx[tok_idx] * w_enc_active.T).sum(dim=-1)
 
                 sa_vals = ga_vals * sg_vals
 
@@ -1197,13 +1284,14 @@ def combine_ga_sg_to_sa(
                     rem_sa = per_token_total - feat_sa_sum
 
                     if tgt_suffix is not None:
-                        recon = sae(x_all)
+                        recon = sae(x_all.to(torch.bfloat16)).float()
                         tgt = act_data.get((li, "mlp_out_all"), x_all)
                         if isinstance(tgt, torch.Tensor) and tgt.device.type == "cpu":
                             tgt = tgt.to(device)
                         remainder = tgt - recon
                     else:
-                        remainder = x_all - sae.decode(sae_acts)
+                        recon_dec = sae.decode(sae_acts.to(torch.bfloat16)).float()
+                        remainder = x_all - recon_dec
 
                     rem_norm = remainder.norm(dim=-1)
                     safe_norm = rem_norm.clamp(min=1e-10).unsqueeze(-1)
@@ -1216,7 +1304,7 @@ def combine_ga_sg_to_sa(
                             dx_r = dx_r[0]
                         drecon = torch.zeros_like(dx_r)
                         if n_active > 0:
-                            drecon.index_add_(0, tok_idx, sg_vals.unsqueeze(-1) * w_dec[feat_idx])
+                            drecon.index_add_(0, tok_idx, sg_vals.unsqueeze(-1) * w_dec_active)
                         rem_sg = (dx_r - drecon).norm(dim=-1)
 
                     rsa, rn = rem_sa.cpu().tolist(), rem_norm.cpu().tolist()
@@ -1229,7 +1317,7 @@ def combine_ga_sg_to_sa(
                             "steering_grad": rsg[t], "steering_attribution": rsa[t],
                         })
 
-                sae.to("cpu")
+                del sae
                 torch.cuda.empty_cache()
 
     return feature_rows
@@ -1249,7 +1337,14 @@ def make_feature_target_loss_fn(target_layer, target_sae_type, target_feature_id
     """Feature-targeted loss: activation of a specific SAE feature."""
     tgt_load = SAE_TYPE_LOAD_MAP.get(target_sae_type, target_sae_type)
     model_size = _model_name_to_sae_size(model_name)
-    target_sae = load_sae(target_layer, sae_width, sae_l0, tgt_load, model_size, True, device)
+    target_sae = load_sae(target_layer, sae_width, sae_l0, tgt_load, model_size, True, device,
+                          dtype=torch.bfloat16)
+    # The target SAE is used as a fixed feature extractor inside the loss.
+    # Freeze its params so backward() does not allocate per-parameter .grad
+    # buffers for it (~11 GB at width=262k, fp32). Loaded in bf16 to fit on
+    # the same GPU as the model.
+    for p in target_sae.parameters():
+        p.requires_grad_(False)
     tgt_in_suffix = SAE_TYPE_KEYS[target_sae_type][0]
 
     def loss_fn(outputs, raw_activations):
@@ -1260,9 +1355,11 @@ def make_feature_target_loss_fn(target_layer, target_sae_type, target_feature_id
         if isinstance(tgt_act, (list, tuple)):
             tgt_act = tgt_act[0]
         tgt_2d = tgt_act[0] if tgt_act.dim() == 3 else tgt_act
-        encoded = target_sae.encode(tgt_2d.float().to(device))
+        # SAE is bf16; encode in bf16, return single scalar (upcast to fp32 for
+        # downstream backward stability).
+        encoded = target_sae.encode(tgt_2d.to(torch.bfloat16).to(device))
         tp = target_token_pos if target_token_pos >= 0 else seq_len + target_token_pos
-        return encoded[tp, target_feature_id]
+        return encoded[tp, target_feature_id].float()
     return loss_fn
 
 
@@ -1418,8 +1515,9 @@ def extract_forward_sa_for_strength(
     # Load source w_dec
     src_load_type = SAE_TYPE_LOAD_MAP.get(source_sae_type, source_sae_type)
     model_size = _model_name_to_sae_size(model_wrapper.model_name)
-    src_sae = load_sae(source_layer, sae_width, sae_l0, src_load_type, model_size, True, device)
-    source_dec_vec = src_sae.w_dec[source_feature_id].detach().clone()
+    src_sae = load_sae(source_layer, sae_width, sae_l0, src_load_type, model_size, True, device,
+                       dtype=torch.bfloat16)
+    source_dec_vec = src_sae.w_dec[source_feature_id].detach().float().clone()
     del src_sae
     torch.cuda.empty_cache()
 
@@ -1457,11 +1555,14 @@ def extract_forward_sa_for_strength(
                 if (li, lt) not in sae_cache or (li, in_sfx) not in fwd_tangent_data:
                     continue
 
-                sae = sae_cache[(li, lt)].to(device=device, dtype=torch.float32).eval()
+                sae = sae_cache[(li, lt)].to(device=device, dtype=torch.bfloat16).eval()
                 dx = fwd_tangent_data[(li, in_sfx)].to(device).float()
                 if dx.dim() == 3:
                     dx = dx[0]
-                fwd_jvp = dx @ sae.w_enc
+                # fwd_jvp = dx @ w_enc done in bf16 then cast to fp32. w_enc at
+                # 262k is ~5.6 GB in bf16 vs 11 GB in fp32; this keeps the SAE
+                # resident alongside the model.
+                fwd_jvp = (dx.to(torch.bfloat16) @ sae.w_enc).float()
 
                 ga_root: Dict[Tuple[int, int], float] = {}
                 if root_df is not None:
@@ -1484,7 +1585,7 @@ def extract_forward_sa_for_strength(
                             "forward_jvp": jvp_val, "gradient_attribution": ga_val,
                             "steering_attribution": jvp_val * ga_val,
                         })
-                sae.to("cpu")
+                del sae
                 torch.cuda.empty_cache()
 
     del fwd_tangent_data

@@ -99,7 +99,7 @@ DEFAULT_CONTROL_SAMPLES_PER_TRIAL = 50
 DEFAULT_N_TRIALS = 30  # DEPRECATED: kept for backward compatibility
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_MAX_TOKENS = 100
-DEFAULT_BATCH_SIZE = 300
+DEFAULT_BATCH_SIZE = 50
 DEFAULT_OUTPUT_DIR = "analysis/02_steering_evaluation"
 DEFAULT_DEVICE = "cuda"
 DEFAULT_DTYPE = "bfloat16"
@@ -268,7 +268,7 @@ def parse_args():
     parser.add_argument("-rf", "--run-forced", action="store_true", help="Run forced injection trials (disabled by default)")
     parser.add_argument("-t", "--temperature", type=float, default=DEFAULT_TEMPERATURE, help="Sampling temperature")
     parser.add_argument("-mt", "--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Max tokens to generate")
-    parser.add_argument("-bs", "--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size for parallel generation (higher = faster but more memory)")
+    parser.add_argument("-bs", "--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size for parallel generation (higher = faster but more memory, default: 10 for large models)")
     parser.add_argument("-od", "--output-dir", type=str, default=DEFAULT_OUTPUT_DIR, help="Output directory")
     parser.add_argument("-d", "--device", type=str, default=DEFAULT_DEVICE, help="Device to run on")
     parser.add_argument("-dt", "--dtype", type=str, default=DEFAULT_DTYPE, choices=["bfloat16", "float16", "float32"], help="Model dtype")
