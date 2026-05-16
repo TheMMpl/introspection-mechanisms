@@ -44,6 +44,7 @@ Usage:
 
 
 import argparse
+import gc
 import json
 import re
 import sys
@@ -88,8 +89,8 @@ DEFAULT_SAE_WIDTH = "262k"
 DEFAULT_SAE_L0 = "big"
 DEFAULT_DIRECTION = "both"  # backward, forward, or both
 
-# SAE types to analyze
-SAE_TYPES = ["resid_post_all", "mlp_out_all", "attn_out_all", "transcoder_all"]
+# SAE types to analyze (mlp_out_all excluded by default; use --include-mlp to enable)
+SAE_TYPES = ["resid_post_all", "attn_out_all", "transcoder_all"]
 
 # Only trace ATTN+TC features to next hop (MLP/RESID redundant with TC/ATTN)
 TRACE_SAE_TYPES = {"attn_out_all", "transcoder_all"}
@@ -106,7 +107,7 @@ def _get_from_list(lst: List[int], hop: int) -> int:
 SAE_TYPE_KEYS = {
     "resid_post_all": ("output", None),
     "mlp_out_all": ("post_feedforward_layernorm.output", None),
-    "attn_out_all": ("attn.o_proj.input", None),
+    "attn_out_all": ("self_attn.o_proj.input", None),
     "transcoder_all": ("pre_feedforward_layernorm.output", "post_feedforward_layernorm.output"),
 }
 
@@ -116,19 +117,25 @@ SAE_TYPE_LOAD_MAP = {
 }
 
 # Activation key suffixes for JVP tangent capture
+# Each suffix matches the key stored by ActivationHooks: hooks registered on
+# module X with name "layer_N.X" store "layer_N.X.input" and "layer_N.X.output".
 JVP_SITE_SUFFIXES = [
-    "attn.o_proj.input",
-    "pre_feedforward_layernorm.output",
-    "post_feedforward_layernorm.output",
-    "output",
+    "self_attn.o_proj.input",          # input to attention output-projection
+    "pre_feedforward_layernorm.output", # transcoder encoder input
+    "post_feedforward_layernorm.output",# MLP / transcoder GA target
+    "output",                          # full-layer residual output
 ]
 
 # Capture types for ActivationHooks
+# These are module navigation paths: hooks land on the named submodule and
+# capture its input (stored as "layer_N.<ct>.input") and output ("…output").
+# Use "output" as a special fallback: navigation fails → hook on the layer
+# itself, storing "layer_N.output" = residual stream after full layer.
 CAPTURE_TYPES_SAE = [
-    "attn.o_proj.input",
-    "pre_feedforward_layernorm.output",
-    "post_feedforward_layernorm.output",
-    "output",
+    "self_attn.o_proj",          # Gemma-3: layer.self_attn.o_proj (Linear)
+    "pre_feedforward_layernorm",  # layer.pre_feedforward_layernorm (RMSNorm)
+    "post_feedforward_layernorm", # layer.post_feedforward_layernorm (RMSNorm)
+    "output",                    # fallback → hook on layer, key = layer_N.output
 ]
 
 # Concept-dependent first-decode token IDs for Gemma3-27B
@@ -240,7 +247,7 @@ def load_sae(
     repo_id = f"google/gemma-scope-2-{model_size}-{variant}"
 
     is_transcoder = sae_type == "transcoder_all"
-    site = "mlp_out_all" if is_transcoder else sae_type
+    site = sae_type
     affine_suffix = "_affine" if is_transcoder else ""
     filename = f"{site}/layer_{layer_idx}_width_{width}_l0_{l0}{affine_suffix}/params.safetensors"
 
@@ -601,7 +608,7 @@ def extract_logit_lens(
         "all_layers": all_layers_tokens,
     }
 
-    strength_str = f"strength_{int(strength)}_{int((strength % 1) * 100):02d}"
+    _h = int(round(strength * 100)); strength_str = f"strength_{_h // 100}_{_h % 100:02d}"
     out_path = output_dir / strength_str / f"logit_lens_trial{trial_num}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
@@ -1197,7 +1204,12 @@ def save_tangent_data(tangent_data: Dict[Tuple[int, str], torch.Tensor], path: P
 def load_tangent_data(path: Path) -> Dict[Tuple[int, str], torch.Tensor]:
     """Load SG tangent data from disk."""
     from safetensors.torch import load_file
-    flat = load_file(str(path))
+    try:
+        flat = load_file(str(path))
+    except Exception as e:
+        print(f"  WARNING: Corrupt SG cache file {path}, deleting and recomputing ({e})")
+        path.unlink(missing_ok=True)
+        raise
     return {(int(k.split("|")[0]), k.split("|")[1]): t for k, t in flat.items()}
 
 
@@ -1236,23 +1248,32 @@ def combine_ga_sg_to_sa(
                 n_active = len(tok_idx)
                 active_acts = sae_acts[tok_idx, feat_idx] if n_active > 0 else torch.tensor([])
 
-                # Upcast only the gathered (sparse) rows of w_dec / w_enc to fp32.
-                w_dec_active = sae.w_dec[feat_idx].float() if n_active > 0 else None
-                w_enc_active = sae.w_enc[:, feat_idx].float() if n_active > 0 else None
-
+                # Compute GA and SG in chunks to avoid materialising a dense
+                # [n_active, d_model] matrix all at once. At high steering
+                # strengths nearly all 262k features can fire, producing a
+                # ~5.6 GB allocation that causes OOM on repeated iterations.
+                _CHUNK = 4096
                 ga_vals = torch.zeros(n_active, device=device)
                 sg_vals = torch.zeros(n_active, device=device)
-                if n_active > 0:
-                    ga_vals = (grad_tensor[tok_idx] * w_dec_active).sum(dim=-1)
-
                 has_gp = cut_strategy.has_grad_path(li, st, injection_layer)
+                dx_sg = None
                 if has_gp and n_active > 0:
                     tkey = (li, in_suffix)
                     if tkey in tangent_data:
-                        dx = tangent_data[tkey].to(device).float()
-                        if dx.dim() == 3:
-                            dx = dx[0]
-                        sg_vals = (dx[tok_idx] * w_enc_active.T).sum(dim=-1)
+                        dx_sg = tangent_data[tkey].to(device).float()
+                        if dx_sg.dim() == 3:
+                            dx_sg = dx_sg[0]
+                for c in range(0, n_active, _CHUNK):
+                    c_end = min(c + _CHUNK, n_active)
+                    c_tok = tok_idx[c:c_end]
+                    c_feat = feat_idx[c:c_end]
+                    w_dec_c = sae.w_dec[c_feat].float()
+                    ga_vals[c:c_end] = (grad_tensor[c_tok] * w_dec_c).sum(dim=-1)
+                    if dx_sg is not None:
+                        sg_vals[c:c_end] = (dx_sg[c_tok] * sae.w_enc[:, c_feat].float().T).sum(dim=-1)
+                    del w_dec_c
+                if dx_sg is not None:
+                    del dx_sg
 
                 sa_vals = ga_vals * sg_vals
 
@@ -1304,7 +1325,12 @@ def combine_ga_sg_to_sa(
                             dx_r = dx_r[0]
                         drecon = torch.zeros_like(dx_r)
                         if n_active > 0:
-                            drecon.index_add_(0, tok_idx, sg_vals.unsqueeze(-1) * w_dec_active)
+                            for c in range(0, n_active, _CHUNK):
+                                c_end = min(c + _CHUNK, n_active)
+                                w_dec_c = sae.w_dec[feat_idx[c:c_end]].float()
+                                drecon.index_add_(0, tok_idx[c:c_end],
+                                                  sg_vals[c:c_end].unsqueeze(-1) * w_dec_c)
+                                del w_dec_c
                         rem_sg = (dx_r - drecon).norm(dim=-1)
 
                     rsa, rn = rem_sa.cpu().tolist(), rem_norm.cpu().tolist()
@@ -1317,6 +1343,8 @@ def combine_ga_sg_to_sa(
                             "steering_grad": rsg[t], "steering_attribution": rsa[t],
                         })
 
+                del grad_tensor, x_all, sae_acts, active_acts, tok_idx, feat_idx
+                del ga_vals, sg_vals, sa_vals
                 del sae
                 torch.cuda.empty_cache()
 
@@ -1416,12 +1444,21 @@ def extract_sa_for_strength(
         hook_factory, n_layers, loss_fn_maker, device, hook_layers)
 
     # Pass 2: SG (with caching)
-    strength_str = f"strength_{int(strength)}_{int((strength % 1) * 100):02d}"
+    _h = int(round(strength * 100)); strength_str = f"strength_{_h // 100}_{_h % 100:02d}"
     sg_file = sg_cache_dir / strength_str / "tangent_data.safetensors" if sg_cache_dir else None
 
     if sg_file and sg_file.exists():
-        tangent_data = load_tangent_data(sg_file)
-        print(f"  SG loaded from cache")
+        try:
+            tangent_data = load_tangent_data(sg_file)
+            print(f"  SG loaded from cache")
+        except Exception:
+            # File was corrupt and deleted by load_tangent_data; recompute
+            tangent_data = compute_sg_pass(
+                inner, input_ids, attention_mask, injection_layer, strength,
+                hook_factory, n_layers, device)
+            if save_sg_cache and sg_file:
+                save_tangent_data(tangent_data, sg_file)
+                print(f"  SG recomputed and cached: {sg_file}")
     else:
         tangent_data = compute_sg_pass(
             inner, input_ids, attention_mask, injection_layer, strength,
@@ -1532,7 +1569,7 @@ def extract_forward_sa_for_strength(
     # Load GA_root from root SA parquet at this strength
     root_df = None
     if root_sa_dir is not None:
-        s_str = f"strength_{int(strength)}_{int((strength % 1) * 100):02d}"
+        _h = int(round(strength * 100)); s_str = f"strength_{_h // 100}_{_h % 100:02d}"
         for t in [trial_num, 1, 2]:
             candidate = root_sa_dir / s_str / f"sa_trial{t}.parquet"
             if candidate.exists():
@@ -1592,7 +1629,7 @@ def extract_forward_sa_for_strength(
     torch.cuda.empty_cache()
 
     src_subdir = f"fwd_{source_sae_type}_L{source_layer}_F{source_feature_id}_T{source_token_pos}"
-    s_str = f"strength_{int(strength)}_{int((strength % 1) * 100):02d}"
+    _h = int(round(strength * 100)); s_str = f"strength_{_h // 100}_{_h % 100:02d}"
     out_path = output_dir / "feat_sa" / src_subdir / s_str / f"feat_sa_trial{trial_num}.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if rows:
@@ -1628,38 +1665,48 @@ def compute_isa(sa_dir: Path, trial_nums: List[int] = None) -> None:
     strengths.sort(key=lambda x: x[0])
 
     for trial in trial_nums:
-        # Load SA at each strength
-        feat_key_to_sa: Dict[Tuple, List[Tuple[float, float]]] = defaultdict(list)
-
+        # Load all strengths and concatenate into one DataFrame, then pivot
+        KEY_COLS = ["layer", "sae_type", "feature_id", "token_pos"]
+        frames = []
+        sorted_s_vals = []
         for s_val, s_dir in strengths:
             parquet = s_dir / f"sa_trial{trial}.parquet"
             if not parquet.exists():
                 continue
-            df = pd.read_parquet(parquet)
-            for _, row in df.iterrows():
-                key = (int(row["layer"]), row["sae_type"], int(row["feature_id"]), int(row["token_pos"]))
-                feat_key_to_sa[key].append((s_val, float(row["steering_attribution"])))
+            df = pd.read_parquet(parquet, columns=KEY_COLS + ["steering_attribution"])
+            df["_strength"] = s_val
+            frames.append(df)
+            sorted_s_vals.append(s_val)
 
-        # Integrate each feature
-        isa_records = []
-        for key, sa_curve in feat_key_to_sa.items():
-            sa_curve.sort(key=lambda x: x[0])
-            if len(sa_curve) < 2:
-                continue
-            ss = np.array([p[0] for p in sa_curve])
-            sa = np.array([p[1] for p in sa_curve])
-            isa_val = float(np.trapezoid(sa, ss))
-            isa_records.append({
-                "layer": key[0], "sae_type": key[1],
-                "feature_id": key[2], "token_pos": key[3],
-                "integrated_steering_attribution": isa_val,
-                "trial_num": trial,
-            })
+        if len(sorted_s_vals) < 2:
+            print(f"  Need >= 2 strength parquets for ISA (trial {trial}), found {len(sorted_s_vals)}")
+            continue
 
-        if isa_records:
-            out = sa_dir / f"isa_trial{trial}.parquet"
-            pd.DataFrame(isa_records).to_parquet(out, index=False)
-            print(f"  ISA computed for trial {trial}: {len(isa_records)} features -> {out}")
+        all_sa = pd.concat(frames, ignore_index=True)
+        del frames
+
+        # Pivot to wide form: rows = features, columns = strengths
+        sa_wide = all_sa.pivot_table(
+            index=KEY_COLS, columns="_strength",
+            values="steering_attribution", aggfunc="first", fill_value=0.0,
+        )
+        del all_sa
+
+        sa_wide = sa_wide.reindex(columns=sorted(sorted_s_vals), fill_value=0.0)
+        strengths_arr = np.array(sa_wide.columns.tolist())
+        sa_matrix = sa_wide.values  # [n_features, n_strengths]
+
+        # Vectorised trapezoidal integration over all features at once
+        isa_vals = np.trapz(sa_matrix, x=strengths_arr, axis=1)
+
+        idx_df = sa_wide.index.to_frame(index=False)
+        idx_df["integrated_steering_attribution"] = isa_vals
+        idx_df["trial_num"] = trial
+        del sa_wide, sa_matrix
+
+        out = sa_dir / f"isa_trial{trial}.parquet"
+        idx_df.to_parquet(out, index=False)
+        print(f"  ISA computed for trial {trial}: {len(idx_df)} features -> {out}")
 
 
 
@@ -1689,6 +1736,8 @@ def parse_args():
     common.add_argument("--sae-l0", type=str, default=DEFAULT_SAE_L0)
     common.add_argument("--pos-token-id", type=int, default=None)
     common.add_argument("--neg-token-id", type=int, default=None)
+    common.add_argument("--include-mlp", action="store_true", default=False,
+                        help="Include mlp_out_all SAE type in analysis (excluded by default)")
 
     # auto-config
     p0 = subparsers.add_parser("auto-config", parents=[common], help="Auto-detect pos/neg tokens and optimal strength")
@@ -1722,6 +1771,9 @@ def main():
     if args.phase is None:
         print("Specify a phase: auto-config, extract-sa, compute-isa, or extract-all")
         return
+
+    if args.include_mlp and "mlp_out_all" not in SAE_TYPES:
+        SAE_TYPES.append("mlp_out_all")
 
     concept = args.concept
     layer = args.layer
@@ -1768,10 +1820,17 @@ def main():
         strengths = np.linspace(0, args.strength_max, args.n_strengths).tolist()
         print(f"Extracting SA at {len(strengths)} strengths (SG cached to {sg_cache})...")
         for s in tqdm(strengths, desc="SA extraction"):
+            _h = int(round(s * 100)); strength_str = f"strength_{_h // 100}_{_h % 100:02d}"
+            parquet_path = base_out / strength_str / f"sa_trial{trial_num}.parquet"
+            if parquet_path.exists():
+                tqdm.write(f"  Skipping {strength_str} (already exists: {parquet_path})")
+                continue
             extract_steering_attribution(
                 mw, concept, vec, layer, s, base_out, trial_num,
                 pos_id, neg_id, args.sae_width, args.sae_l0, args.device,
                 sg_cache_dir=sg_cache)
+            gc.collect()
+            torch.cuda.empty_cache()
 
         print("Computing ISA...")
         compute_isa(base_out, [trial_num])
