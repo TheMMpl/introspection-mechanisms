@@ -38,6 +38,7 @@ Usage:
 """
 
 import argparse
+import gc
 import json
 import re
 import sys
@@ -382,8 +383,13 @@ def build_attribution_graph(
             # Extract feature-targeted SA (uses SG cache from hop-0)
             sg_cache = output_dir / "sg_cache"
             for target in bwd_targets:
+                tgt_subdir = f"{target.sae_type}_L{target.layer}_F{target.feature_id}_T{target.token_pos}"
                 print(f"    {target.short_name()}...")
                 for s in tqdm(feat_sa_strengths, desc=f"    SA", leave=False):
+                    _h = int(round(s * 100)); _s_str = f"strength_{_h // 100}_{_h % 100:02d}"
+                    _parquet = output_dir / "feat_sa" / tgt_subdir / _s_str / f"feat_sa_trial{trial_nums[0]}.parquet"
+                    if _parquet.exists():
+                        continue
                     extract_feature_target_sa(
                         model_wrapper, concept, concept_vector,
                         injection_layer, s,
@@ -429,8 +435,13 @@ def build_attribution_graph(
 
             # Extract forward SA for each source
             for source in fwd_sources:
+                src_subdir = f"fwd_{source.sae_type}_L{source.layer}_F{source.feature_id}_T{source.token_pos}"
                 print(f"    {source.short_name()}...")
                 for s in tqdm(feat_sa_strengths, desc=f"    fwd SA", leave=False):
+                    _h = int(round(s * 100)); _s_str = f"strength_{_h // 100}_{_h % 100:02d}"
+                    _parquet = output_dir / "feat_sa" / src_subdir / _s_str / f"feat_sa_trial{trial_nums[0]}.parquet"
+                    if _parquet.exists():
+                        continue
                     extract_forward_sa_for_strength(
                         model_wrapper, concept, concept_vector,
                         injection_layer, s,
@@ -682,6 +693,8 @@ def parse_args():
     common.add_argument("--sae-l0", type=str, default=DEFAULT_SAE_L0)
     common.add_argument("--pos-token-id", type=int, default=None)
     common.add_argument("--neg-token-id", type=int, default=None)
+    common.add_argument("--include-mlp", action="store_true", default=False,
+                        help="Include mlp_out_all SAE type in analysis (excluded by default)")
 
     # auto-config
     p0 = subparsers.add_parser("auto-config", parents=[common], help="Auto-detect pos/neg tokens and optimal strength")
@@ -737,6 +750,9 @@ def main():
     if args.phase is None:
         print("Specify a phase: build-graph, visualize, all (or extract-sa, compute-isa, auto-config)")
         return
+
+    if args.include_mlp and "mlp_out_all" not in _sa_mod.SAE_TYPES:
+        _sa_mod.SAE_TYPES.append("mlp_out_all")
 
     concept = args.concept
     layer = args.layer
@@ -827,10 +843,17 @@ def main():
         strengths = np.linspace(0, args.strength_max, args.n_strengths).tolist()
         print(f"\nStep 1: Extracting SA at {len(strengths)} strengths (SG cached to {sg_cache})...")
         for s in tqdm(strengths, desc="SA extraction"):
+            _h = int(round(s * 100)); strength_str = f"strength_{_h // 100}_{_h % 100:02d}"
+            parquet_path = base_out / strength_str / f"sa_trial{trial_num}.parquet"
+            if parquet_path.exists():
+                tqdm.write(f"  Skipping {strength_str} (already exists: {parquet_path})")
+                continue
             extract_steering_attribution(
                 mw, concept, vec, layer, s, base_out, trial_num,
                 pos_id, neg_id, args.sae_width, args.sae_l0, args.device,
                 sg_cache_dir=sg_cache)
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # Step 2: Compute ISA
         print("\nStep 2: Computing ISA...")

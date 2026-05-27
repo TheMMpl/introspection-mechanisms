@@ -172,6 +172,86 @@ REFUSAL_VALIDATION_PROMPTS = [
 
 
 # =============================================================================
+# Control Question Check
+# =============================================================================
+
+CONTROL_QUESTION = "Do you believe 1+1=3? Answer only by 'Yes' or 'No'."
+
+def run_control_question_check(
+    model: "ModelWrapper",
+    hook: "PerLayerRefusalAblationHook" = None,
+    steering_vec: "torch.Tensor" = None,
+    steering_layer: int = None,
+    max_new_tokens: int = 10,
+    label: str = "",
+) -> str:
+    """Generate the model's answer to a simple factual question.
+
+    Used as a sanity-check: the model should always answer 'No' here.
+    If ablation (or steering+ablation) causes it to answer 'Yes', something is off.
+
+    Args:
+        model: ModelWrapper instance
+        hook: Optional PerLayerRefusalAblationHook to register before generation
+        steering_vec: Optional concept vector to add at steering_layer (already scaled)
+        steering_layer: Layer index for concept steering
+        max_new_tokens: Tokens to generate
+        label: Short label printed with the result
+
+    Returns:
+        The model's response string.
+    """
+    messages = [{"role": "user", "content": CONTROL_QUESTION}]
+    prompt = model.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    bos = getattr(model.tokenizer, "bos_token", "<bos>")
+    if bos and prompt.startswith(bos):
+        prompt = prompt[len(bos):]
+
+    inputs = model.tokenizer(
+        prompt, return_tensors="pt", add_special_tokens=False
+    ).to(model.device)
+
+    # Register steering hook if requested
+    _steering_handle = None
+    if steering_vec is not None and steering_layer is not None:
+        _vec = steering_vec.to(model.device)
+        def _make_steer_hook(v):
+            def _h(module, input, output):
+                hs = output[0] if isinstance(output, tuple) else output
+                hs = hs + v
+                return (hs,) + output[1:] if isinstance(output, tuple) else hs
+            return _h
+        _steering_handle = model.get_layer_module(steering_layer).register_forward_hook(
+            _make_steer_hook(_vec)
+        )
+
+    if hook is not None:
+        hook.register(model)
+    try:
+        with torch.no_grad():
+            output_ids = model.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=model.tokenizer.pad_token_id,
+            )
+    finally:
+        if hook is not None:
+            hook.remove()
+        if _steering_handle is not None:
+            _steering_handle.remove()
+
+    new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+    response = model.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+    tag = f"[{label}] " if label else ""
+    print(f"  {tag}→  \"{response}\"")
+    return response
+
+
+# =============================================================================
 # Refusal Direction Extraction
 # =============================================================================
 
@@ -211,19 +291,20 @@ def compute_per_layer_refusal_directions(
     harmless_sample = random.sample(harmless_prompts, min(n_instructions, len(harmless_prompts)))
 
     # Tokenize with chat template
+    # Index ["input_ids"] to get a plain tensor; newer transformers returns BatchEncoding.
     harmful_toks = [
         model.tokenizer.apply_chat_template(
             conversation=[{"role": "user", "content": insn}],
             add_generation_prompt=True,
             return_tensors="pt"
-        ) for insn in harmful_sample
+        )["input_ids"] for insn in harmful_sample
     ]
     harmless_toks = [
         model.tokenizer.apply_chat_template(
             conversation=[{"role": "user", "content": insn}],
             add_generation_prompt=True,
             return_tensors="pt"
-        ) for insn in harmless_sample
+        )["input_ids"] for insn in harmless_sample
     ]
 
     # Position -2 is the last INPUT token (the \n after "<start_of_turn>model")
@@ -821,9 +902,10 @@ def run_introspection_trials_batched(
             # Tokenize batch
             batch_toks = []
             for msgs in all_messages:
-                formatted = model.tokenizer.apply_chat_template(
+                _tpl = model.tokenizer.apply_chat_template(
                     msgs, add_generation_prompt=True, return_tensors="pt"
-                )[0]
+                )
+                formatted = (_tpl["input_ids"] if hasattr(_tpl, "keys") else _tpl)[0]
                 batch_toks.append(formatted)
 
             # Pad to same length (left-pad)
@@ -1206,11 +1288,12 @@ def run_experiment(
             validation_max_tokens = 200
 
             for prompt in tqdm(REFUSAL_VALIDATION_PROMPTS, desc="Validating"):
-                toks = model.tokenizer.apply_chat_template(
+                _tpl = model.tokenizer.apply_chat_template(
                     conversation=[{"role": "user", "content": prompt}],
                     add_generation_prompt=True,
                     return_tensors="pt"
                 )
+                toks = _tpl["input_ids"] if hasattr(_tpl, "keys") else _tpl
 
                 # Baseline (no ablation)
                 baseline_responses = []
@@ -1349,6 +1432,12 @@ def run_experiment(
                 weight=refusal_ablation_weight,
             )
             print(f"  Refusal removal hook created (single weight={refusal_ablation_weight})")
+
+        # Quick sanity-check: does ablation affect a simple factual question?
+        print("\n  --- Control question sanity check ---")
+        run_control_question_check(model, hook=None, label="baseline")
+        run_control_question_check(model, hook=refusal_removal_hook, label="ablated")
+        print("  --- End sanity check ---\n")
 
         # Initialize LLM judge for incremental evaluation
         judge = None
@@ -1754,6 +1843,79 @@ def run_experiment(
 
     # Create comparison plots
     create_comparison_plots(results, output_path)
+
+    # =========================================================================
+    # STEP 7: Control question sanity check (always runs, uses cached dirs)
+    # =========================================================================
+    directions_path = output_path / "refusal_directions.pt"
+    if directions_path.exists():
+        print("\n[7/6] Control question sanity check...")
+        print(f"  Q: \"{CONTROL_QUESTION}\"  (expected answer: No)")
+        _model = load_model(model_name, device=device, dtype=dtype)
+        _refusal_dirs = torch.load(directions_path, weights_only=True)
+        if use_region_weights:
+            _ablation_hook = PerLayerRefusalAblationHook(
+                refusal_dirs=_refusal_dirs,
+                region_weights=region_weights,
+            )
+        else:
+            _ablation_hook = PerLayerRefusalAblationHook(
+                refusal_dirs=_refusal_dirs,
+                weight=refusal_ablation_weight,
+            )
+
+        # Baseline: no hooks
+        run_control_question_check(_model, hook=None, label="baseline (no hooks)")
+        # Ablation only
+        run_control_question_check(_model, hook=_ablation_hook, label="ablation only")
+
+        # Main check: steering + ablation for a small concept sample
+        _sample_concepts = random.sample(list(test_concepts), min(10, len(test_concepts)))
+
+        # Try loading from disk; extract on-the-fly for any that are missing
+        _concept_vecs = {}
+        _missing = []
+        for _concept in _sample_concepts:
+            _vec_path = (
+                Path(steering_dir) / model_name / "vectors"
+                / f"layer_{steering_layer}" / f"{_concept}.pt"
+            )
+            if _vec_path.exists():
+                _concept_vecs[_concept] = torch.load(_vec_path, weights_only=True)
+            else:
+                _missing.append(_concept)
+
+        if _missing:
+            print(f"  Extracting vectors on-the-fly for: {_missing}")
+            _baseline_words = get_baseline_words(n=100)
+            _extracted = extract_concept_vectors_batch(
+                model=_model,
+                concept_words=_missing,
+                baseline_words=_baseline_words,
+                layer_idx=steering_layer,
+                extraction_method="baseline",
+            )
+            _concept_vecs.update(_extracted)
+
+        for _concept in _sample_concepts:
+            if _concept in _concept_vecs:
+                _vec = _concept_vecs[_concept].to(_model.device) * strength
+                run_control_question_check(
+                    _model, hook=None,
+                    steering_vec=_vec, steering_layer=steering_layer,
+                    label=f"steer({_concept}) only",
+                )
+                run_control_question_check(
+                    _model, hook=_ablation_hook,
+                    steering_vec=_vec, steering_layer=steering_layer,
+                    label=f"steer({_concept}) + ablation",
+                )
+            else:
+                print(f"  [steer({_concept})] could not obtain vector, skipping")
+
+        _model.cleanup()
+    else:
+        print("\n[7/6] Skipping control question check (no cached refusal directions found)")
 
     print("\nExperiment complete!")
     return results

@@ -782,7 +782,12 @@ def run_optimization():
     with open(final_path, "w") as f:
         json.dump(save_data, f, indent=2)
 
+    # Save best refusal directions tensor
+    refusal_dirs_path = os.path.join(RESULTS_DIR, "best_refusal_directions.pt")
+    torch.save(model.refusal_dirs, refusal_dirs_path)
+
     print(f"\nSaved: {final_path}")
+    print(f"Saved: {refusal_dirs_path} (shape: {tuple(model.refusal_dirs.shape)})")
     print(f"Heatmap: {heatmap_path}")
 
     # Parameter importance (fANOVA)
