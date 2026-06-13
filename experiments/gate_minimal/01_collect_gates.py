@@ -41,6 +41,167 @@ import prompts as P
 from model_utils import load_model
 
 
+def _format_detection_prompt_text(
+    tokenizer,
+    trial: int,
+    prefill_word: str | None,
+    n_extra_words: int,
+    prefill_variant: str,
+    detect_variant: str,
+) -> str:
+    msgs = P.build_messages(
+        trial_n=trial,
+        prefill_word=prefill_word,
+        n_extra_words=n_extra_words,
+        mode="detect",
+        prefill_variant=prefill_variant,
+        detect_variant=detect_variant,
+    )
+    return tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=True
+    )
+
+
+def _generate_text(
+    model_w,
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+) -> str:
+    inputs = model_w.tokenizer(
+        prompt, return_tensors="pt", add_special_tokens=False
+    ).to(model_w._get_input_device())
+    input_length = inputs["input_ids"].shape[1]
+
+    gen_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": model_w.tokenizer.pad_token_id,
+    }
+    if temperature > 0:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = temperature
+
+    with torch.no_grad():
+        output_ids = model_w.model.generate(**inputs, **gen_kwargs)
+
+    new_tokens = output_ids[0][input_length:]
+    if model_w.model_name in ["kimi_k2", "deepseek_v3"]:
+        output_text = model_w.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+    else:
+        output_text = model_w.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    gemma_models = [
+        "gemma_2b", "gemma_7b", "gemma2_2b", "gemma2_9b",
+        "gemma2_27b", "gemma3_27b",
+    ]
+    if model_w.model_name in gemma_models and output_text.startswith("model\n"):
+        output_text = output_text[len("model\n"):]
+
+    return output_text.strip()
+
+
+def preview_setting_responses(
+    model_w,
+    setting: str,
+    prefill_variant: str,
+    detect_variant: str,
+    concepts: List[str],
+    steering_layer: int,
+    strength: float,
+    n_trials: int,
+    n_extra_words: int,
+    concept_vectors: Dict[str, torch.Tensor],
+    yes_ids: List[int],
+    no_ids: List[int],
+    response_limit: int,
+    response_max_new_tokens: int,
+    response_temperature: float,
+    output_dir: Path,
+) -> List[Dict]:
+    """Generate and save a small response preview for qualitative inspection."""
+    assert setting in ("injection", "prefill")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    records: List[Dict] = []
+    remaining = response_limit
+    desc = f"[{setting}] response preview"
+
+    for concept in tqdm(concepts, desc=desc):
+        for trial in range(1, n_trials + 1):
+            if response_limit > 0 and remaining <= 0:
+                break
+
+            prefill_word = concept if setting == "prefill" else None
+            prompt_text = _format_detection_prompt_text(
+                model_w.tokenizer,
+                trial,
+                prefill_word,
+                n_extra_words,
+                prefill_variant,
+                detect_variant,
+            )
+            input_ids = model_w.tokenizer(
+                prompt_text, return_tensors="pt", add_special_tokens=False
+            )["input_ids"]
+
+            handle = None
+            if setting == "injection":
+                vec = concept_vectors[concept]
+                hook = gl.make_injection_hook(vec, strength)
+                handle = model_w.get_layer_module(steering_layer).register_forward_hook(hook)
+            try:
+                with torch.no_grad():
+                    out = model_w.model(
+                        input_ids=input_ids.to(model_w.device), use_cache=False
+                    )
+                logits = out.logits[:, -1, :].float().cpu()
+                response = _generate_text(
+                    model_w,
+                    prompt_text,
+                    max_new_tokens=response_max_new_tokens,
+                    temperature=response_temperature,
+                )
+            finally:
+                if handle is not None:
+                    handle.remove()
+                    torch.cuda.empty_cache()
+
+            gap = float(P.logit_gap(logits, yes_ids, no_ids).item())
+            top_token_id = int(logits.argmax(dim=-1).item())
+            detect_argmax = bool(P.top_token_is_yes(logits, yes_ids))
+            record = {
+                "setting": setting,
+                "concept": concept,
+                "trial": trial,
+                "prefill_variant": prefill_variant,
+                "detect_variant": detect_variant,
+                "prompt": prompt_text,
+                "response": response,
+                "gap": gap,
+                "detect_gap": gap > 0.0,
+                "detect_argmax": detect_argmax,
+                "top_token_id": top_token_id,
+            }
+            records.append(record)
+            print(
+                f"[{setting}] concept={concept} trial={trial} gap={gap:+.3f} "
+                f"argmax_yes={detect_argmax}\n"
+                f"  response: {response}"
+            )
+            if response_limit > 0:
+                remaining -= 1
+
+        if response_limit > 0 and remaining <= 0:
+            break
+
+    preview_path = output_dir / "response_preview.jsonl"
+    with open(preview_path, "w") as f:
+        for rec in records:
+            f.write(json.dumps(rec) + "\n")
+    print(f"[{setting}] saved response preview -> {preview_path}")
+    return records
+
+
 def collect_setting(
     model_w,
     setting: str,
@@ -223,6 +384,30 @@ def main():
     )
     p.add_argument("--concepts", nargs="+", default=None,
                    help="Concepts (default: 50 BASELINE_CONCEPTS).")
+    p.add_argument(
+        "--response-mode",
+        choices=["off", "preview", "only"],
+        default="off",
+        help="Optionally generate full model responses for qualitative inspection.",
+    )
+    p.add_argument(
+        "--response-limit",
+        type=int,
+        default=12,
+        help="Maximum number of generated samples per setting in response preview mode. 0 = all.",
+    )
+    p.add_argument(
+        "--response-max-new-tokens",
+        type=int,
+        default=64,
+        help="Maximum generated tokens per response preview sample.",
+    )
+    p.add_argument(
+        "--response-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for response preview generation (0 = greedy).",
+    )
     p.add_argument("--n-top", type=int, default=200)
     p.add_argument("--output-dir", "-od", default="analysis/gate_minimal")
     p.add_argument("--device", "-d", default="cuda")
@@ -258,6 +443,27 @@ def main():
             Path(args.output_dir) / args.model
             / f"{setting_tag}_L{args.steering_layer}_s{args.strength}"
         )
+        if args.response_mode in ("preview", "only"):
+            preview_setting_responses(
+                model_w=model_w,
+                setting=setting,
+                prefill_variant=args.prefill_variant,
+                detect_variant=args.detect_variant,
+                concepts=concepts,
+                steering_layer=args.steering_layer,
+                strength=args.strength,
+                n_trials=args.n_trials,
+                n_extra_words=args.n_extra_words,
+                concept_vectors=concept_vectors,
+                yes_ids=yes_ids,
+                no_ids=no_ids,
+                response_limit=args.response_limit,
+                response_max_new_tokens=args.response_max_new_tokens,
+                response_temperature=args.response_temperature,
+                output_dir=out_dir,
+            )
+        if args.response_mode == "only":
+            continue
         collect_setting(
             model_w=model_w,
             setting=setting,
