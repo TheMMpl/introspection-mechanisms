@@ -37,10 +37,15 @@ Identification curve
 Outputs
 -------
   ablation_results.json
-  ablation_curves.png          (gap-based detection rates)
-  ablation_curves_argmax.png   (strict next-token detection rates)
-  logit_effects.png            (ΔYes vs ΔNo logits, per detection curve)
+  ablation_curves.png          (gap-based detection rates, introspection only)
+  ablation_curves_argmax.png   (strict next-token detection rates, introspection only)
+  logit_effects.png            (ΔYes vs ΔNo logits, per introspection curve)
   arithmetic_control.png       (Yes-bias on the factual control)
+  control_curves.png           (factual-control Yes-rate: ablate vs patch + steered marker)
+  control_curves_argmax.png    (same, strict next-token)
+  control_logits.png           (Yes/No logsumexp for the factual-control curves)
+  overlay_curves.png           (introspection vs control Yes-rate, patch & revert)
+  overlay_logits.png           (introspection vs control Yes/No logsumexp, patch & revert)
 """
 
 import argparse
@@ -63,13 +68,19 @@ from model_utils import load_model
 
 
 # Curves whose samples carry the full detection_record (gap/argmax/yes/no).
-DETECTION_CURVES = [
+# Split into the introspection (concept-detection) curves that go in the main
+# detection plots, and the factual-control curves that go in their own image.
+INTROSPECTION_DETECTION_CURVES = [
     "ablate_control_detection",
     "ablate_steered_detection",
     "patch_detection",
     "reverse_patch_detection",
-    "ablate_arithmetic_control",
 ]
+CONTROL_DETECTION_CURVES = [
+    "ablate_arithmetic_control",
+    "patch_arithmetic_control",
+]
+DETECTION_CURVES = INTROSPECTION_DETECTION_CURVES + CONTROL_DETECTION_CURVES
 ALL_CURVES = DETECTION_CURVES + ["ablate_identification"]
 
 
@@ -216,6 +227,44 @@ def main():
     if "ablate_identification" in args.curves:
         curves["ablate_identification"] = {"id_rate": {}}
 
+    # ── Factual-control prep (constant prompt; K-independent references) ────
+    # The factual-control question is concept- and trial-independent, so its
+    # un-intervened record only needs one forward and is reused at K=0.
+    arith_ids = P.format_arithmetic_control_prompt(tokenizer, args.arithmetic_question)
+    unsteered_arith_record = None
+    if "patch_arithmetic_control" in det_curves:
+        unsteered_arith_record = P.detection_record(
+            gl.forward_last_logits(model_w, arith_ids), yes_ids, no_ids
+        )
+
+    # Steered factual-control baseline: inject each concept's steering vector
+    # into the 2+2=5 prompt and average the Yes/No logits + Yes-rate. This is
+    # the "steered baseline" marker on the control plots and the reference the
+    # gate-patch is compared against. Only well-defined for the injection
+    # setting (no clean way to steer the bare factual question under prefill).
+    arith_steered_baseline = None
+    if args.setting == "injection" and (
+        "patch_arithmetic_control" in det_curves
+        or "ablate_arithmetic_control" in det_curves
+    ):
+        arith_recs: List[dict] = []
+        for concept in tqdm(concepts, desc="steered 2+2=5 baseline"):
+            h = injection_handle(concept)
+            try:
+                logits_sa = gl.forward_last_logits(model_w, arith_ids)
+            finally:
+                if h is not None:
+                    h.remove()
+            arith_recs.append(P.detection_record(logits_sa, yes_ids, no_ids))
+        arith_steered_baseline = _aggregate_records(arith_recs)
+        print(
+            "[02] steered 2+2=5 baseline: "
+            f"gap_rate={arith_steered_baseline['detect_gap_rate']:.2f} "
+            f"argmax_rate={arith_steered_baseline['detect_argmax_rate']:.2f} "
+            f"yes={arith_steered_baseline['mean_yes_lse']:.2f} "
+            f"no={arith_steered_baseline['mean_no_lse']:.2f}"
+        )
+
     # ── Sweep over K (K=0 is the un-ablated baseline; no slices loaded) ─────
     for k in k_grid:
         if k == 0:
@@ -277,8 +326,13 @@ def main():
                     logits_id = ablated_logits(id_ids, slices, involved, concept_for_injection=concept)
                     id_acc.append(int(logits_id.argmax(dim=-1).item()) == concept_tok[concept])
 
-                # patch: steered → unsteered knock-in
-                if "patch_detection" in det_curves:
+                # patch: steered → unsteered knock-in. The same captured
+                # steered gate activations are knocked into (a) the unsteered
+                # detection prompt and (b) the unsteered factual-control prompt,
+                # so we can tell whether the gates carry concept information or
+                # are just an efficient generic Yes-push.
+                if ("patch_detection" in det_curves
+                        or "patch_arithmetic_control" in det_curves):
                     det_ids = P.format_detection_prompt(
                         tokenizer,
                         trial,
@@ -295,8 +349,9 @@ def main():
                         prefill_variant=prefill_variant,
                         detect_variant=detect_variant,
                     )
+                    # Capture the gates' steered activations once (None at K=0).
                     if k == 0 or not involved:
-                        logits_p = gl.forward_last_logits(model_w, base_ids)
+                        steered_sel = None
                     else:
                         h = injection_handle(concept)
                         try:
@@ -309,15 +364,36 @@ def main():
                         finally:
                             if h is not None:
                                 h.remove()
-                        with ExitStack() as stack:
-                            for L in involved:
-                                stack.enter_context(
-                                    gl.GatePatch(model_w, slices[L], steered_sel=steered_sel[L])
-                                )
+
+                    if "patch_detection" in det_curves:
+                        if steered_sel is None:
                             logits_p = gl.forward_last_logits(model_w, base_ids)
-                    records["patch_detection"].append(
-                        P.detection_record(logits_p, yes_ids, no_ids)
-                    )
+                        else:
+                            with ExitStack() as stack:
+                                for L in involved:
+                                    stack.enter_context(
+                                        gl.GatePatch(model_w, slices[L], steered_sel=steered_sel[L])
+                                    )
+                                logits_p = gl.forward_last_logits(model_w, base_ids)
+                        records["patch_detection"].append(
+                            P.detection_record(logits_p, yes_ids, no_ids)
+                        )
+
+                    # patch arithmetic control: knock the *same* steered gate
+                    # activations into the unsteered 2+2=5 prompt.
+                    if "patch_arithmetic_control" in det_curves:
+                        if steered_sel is None:
+                            records["patch_arithmetic_control"].append(dict(unsteered_arith_record))
+                        else:
+                            with ExitStack() as stack:
+                                for L in involved:
+                                    stack.enter_context(
+                                        gl.GatePatch(model_w, slices[L], steered_sel=steered_sel[L])
+                                    )
+                                logits_pa = gl.forward_last_logits(model_w, arith_ids)
+                            records["patch_arithmetic_control"].append(
+                                P.detection_record(logits_pa, yes_ids, no_ids)
+                            )
 
                 # reverse patch: steered run with gates knocked-in to their
                 # *unsteered* values (checks whether reverting the gates back to
@@ -370,7 +446,6 @@ def main():
 
         # arithmetic control: deterministic, run once per K (concept-independent)
         if "ablate_arithmetic_control" in det_curves:
-            arith_ids = P.format_arithmetic_control_prompt(tokenizer, args.arithmetic_question)
             logits_a = ablated_logits(arith_ids, slices, involved)
             records["ablate_arithmetic_control"].append(
                 P.detection_record(logits_a, yes_ids, no_ids)
@@ -421,6 +496,7 @@ def main():
             c: {metric: _strkeys(curves[c][metric]) for metric in curves[c]}
             for c in curves
         },
+        "arith_steered_baseline": arith_steered_baseline,
     }
     with open(out_dir / "ablation_results.json", "w") as f:
         json.dump(results, f, indent=2)
@@ -433,6 +509,13 @@ def main():
     plot_logit_effects(results, out_dir / "logit_effects.png")
     plot_logit_effects_raw(results, out_dir / "logit_effects_raw.png")
     plot_arithmetic_control(results, out_dir / "arithmetic_control.png")
+    plot_controls(results, out_dir / "control_curves.png", metric="detect_gap_rate",
+                  title_suffix="gap-based")
+    plot_controls(results, out_dir / "control_curves_argmax.png", metric="detect_argmax_rate",
+                  title_suffix="strict next-token")
+    plot_control_logits(results, out_dir / "control_logits.png")
+    plot_overlay_rates(results, out_dir / "overlay_curves.png")
+    plot_overlay_logits(results, out_dir / "overlay_logits.png")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,7 +527,8 @@ _DET_STYLE = {
     "ablate_steered_detection": ("Ablating: steered (TP)", "tab:orange", "D"),
     "patch_detection": ("Patching steered \u2192 unsteered", "tab:green", "s"),
     "reverse_patch_detection": ("Reverting gates steered \u2192 unsteered (TP)", "tab:brown", "P"),
-    "ablate_arithmetic_control": ("Ablating: factual control (1+1=3)", "tab:purple", "v"),
+    "ablate_arithmetic_control": ("Ablating: factual control (2+2=5)", "tab:purple", "v"),
+    "patch_arithmetic_control": ("Patching gates \u2192 factual control (2+2=5)", "tab:cyan", "X"),
     "ablate_identification": ("Ablating steered (forced): identification", "tab:blue", "^"),
 }
 
@@ -472,6 +556,10 @@ def plot_detection_rates(results: dict, out_path: Path, metric: str, title_suffi
 
     fig, ax = plt.subplots(figsize=(8, 5))
     for key, cdata in results["curves"].items():
+        # Main detection plot shows introspection curves only; factual-control
+        # curves live in their own image (control_curves.png / overlay_*).
+        if key not in INTROSPECTION_DETECTION_CURVES and key != "ablate_identification":
+            continue
         if key == "ablate_identification":
             mc = cdata.get("id_rate")
         else:
@@ -497,7 +585,7 @@ def plot_detection_rates(results: dict, out_path: Path, metric: str, title_suffi
 
 
 def plot_logit_effects(results: dict, out_path: Path):
-    """For each detection curve, plot ΔYes and ΔNo logsumexp relative to K=0,
+    """For each introspection curve, plot ΔYes and ΔNo logsumexp relative to K=0,
     so the change in the detection gap can be attributed to the Yes side, the
     No side, or both. Δgap == ΔYes - ΔNo.
     """
@@ -505,7 +593,7 @@ def plot_logit_effects(results: dict, out_path: Path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    det_curves = [c for c in DETECTION_CURVES if c in results["curves"]
+    det_curves = [c for c in INTROSPECTION_DETECTION_CURVES if c in results["curves"]
                   and results["curves"][c].get("mean_yes_lse")]
     if not det_curves:
         return
@@ -544,13 +632,13 @@ def plot_logit_effects(results: dict, out_path: Path):
 
 
 def plot_logit_effects_raw(results: dict, out_path: Path):
-    """For each detection curve, plot the raw Yes and No logsumexp terms (not
+    """For each introspection curve, plot the raw Yes and No logsumexp terms (not
     deltas) vs K, so absolute logit levels are visible alongside their gap."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    det_curves = [c for c in DETECTION_CURVES if c in results["curves"]
+    det_curves = [c for c in INTROSPECTION_DETECTION_CURVES if c in results["curves"]
                   and results["curves"][c].get("mean_yes_lse")]
     if not det_curves:
         return
@@ -602,7 +690,7 @@ def plot_arithmetic_control(results: dict, out_path: Path):
     axL.plot(gk, [v * 100 for v in ar], marker="^", color="tab:pink", label="Yes (argmax)")
     axL.set_ylim(-5, 105)
     axL.set_xlabel("K")
-    axL.set_ylabel("Says Yes to '1+1=3' (%)")
+    axL.set_ylabel("Says Yes to factual control (%)")
     axL.set_title("Yes-bias on factual control")
     axL.legend(fontsize=9)
     _apply_k_xscale(axL, gk)
@@ -628,6 +716,231 @@ def plot_arithmetic_control(results: dict, out_path: Path):
     cfg = results["config"]
     fig.suptitle(f"Factual control: {cfg.get('arithmetic_question','')}", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[02] Saved plot -> {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Factual-control plots (moved out of the main detection image) + overlays
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_num(x) -> bool:
+    return x is not None and isinstance(x, (int, float)) and x == x  # not None / NaN
+
+
+def _baseline_hline(ax, results: dict, metric: str, scale: float = 1.0,
+                    color: str = "0.35", ls: str = "--"):
+    """Draw the steered factual-control baseline as a horizontal reference line.
+
+    ``metric`` selects which baseline scalar to mark (e.g. ``detect_gap_rate``,
+    ``mean_yes_lse``). Returns the value drawn (or None if unavailable).
+    """
+    base = results.get("arith_steered_baseline")
+    if not base:
+        return None
+    val = base.get(metric)
+    if not _is_num(val):
+        return None
+    label = f"Steered 2+2=5 baseline ({val * scale:.0f}%)" if scale == 100 \
+        else f"Steered 2+2=5 baseline ({val:.1f})"
+    ax.axhline(val * scale, color=color, ls=ls, lw=1.3, label=label)
+    return val
+
+
+def plot_controls(results: dict, out_path: Path, metric: str, title_suffix: str):
+    """Factual-control Yes-rate vs K for the ablate and patch interventions,
+    with the steered (injected) 2+2=5 baseline marked as a horizontal line.
+
+    Reading the result: if knocking concept-steered gates into the unrelated
+    2+2=5 prompt drives the Yes-rate up toward the steered baseline, the gates
+    act as a generic Yes-push; if it stays near the unsteered floor, they carry
+    concept-specific information rather than a blanket bias.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    plotted_ks = None
+    for key in CONTROL_DETECTION_CURVES:
+        cdata = results["curves"].get(key)
+        if not cdata or not cdata.get(metric):
+            continue
+        ks, ys = _ks_ys(cdata[metric])
+        plotted_ks = ks
+        label, color, marker = _DET_STYLE[key]
+        ax.plot(ks, [v * 100 for v in ys], marker=marker, color=color, label=label)
+
+    _baseline_hline(ax, results, metric, scale=100)
+
+    cfg = results["config"]
+    ax.set_ylim(-5, 105)
+    ax.set_xlabel("Top gate features ablated/patched (K)  — K=0 is no intervention")
+    ax.set_ylabel("Says Yes to 2+2=5 (%)")
+    ax.set_title(f"Factual control — {title_suffix}\n"
+                 f"({cfg['setting']}, L={cfg['steering_layer']}, s={cfg['strength']})")
+    ax.legend(fontsize=9, loc="best")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[02] Saved plot -> {out_path}")
+
+
+def plot_control_logits(results: dict, out_path: Path):
+    """Raw Yes/No logsumexp vs K for the factual-control curves, with the
+    steered 2+2=5 Yes/No baselines marked as horizontal lines."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ctrl = [c for c in CONTROL_DETECTION_CURVES if c in results["curves"]
+            and results["curves"][c].get("mean_yes_lse")]
+    if not ctrl:
+        return
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for key in ctrl:
+        cdata = results["curves"][key]
+        yk, yv = _ks_ys(cdata["mean_yes_lse"])
+        _, nv = _ks_ys(cdata["mean_no_lse"])
+        label, color, marker = _DET_STYLE[key]
+        ax.plot(yk, yv, marker=marker, color=color, ls="-", label=f"{label}: Yes")
+        ax.plot(yk, nv, marker=marker, color=color, ls=":", label=f"{label}: No")
+        last_ks = yk
+
+    base = results.get("arith_steered_baseline")
+    if base:
+        if _is_num(base.get("mean_yes_lse")):
+            ax.axhline(base["mean_yes_lse"], color="0.25", ls="--", lw=1.2,
+                       label="Steered 2+2=5: Yes")
+        if _is_num(base.get("mean_no_lse")):
+            ax.axhline(base["mean_no_lse"], color="0.55", ls="--", lw=1.2,
+                       label="Steered 2+2=5: No")
+
+    cfg = results["config"]
+    _apply_k_xscale(ax, last_ks)
+    ax.set_xlabel("K")
+    ax.set_ylabel("logsumexp (nats)")
+    ax.set_title(f"Factual control — raw Yes/No logits\n"
+                 f"({cfg['setting']}, L={cfg['steering_layer']}, s={cfg['strength']})")
+    ax.legend(fontsize=8, loc="best")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[02] Saved plot -> {out_path}")
+
+
+def _overlay_rate_axis(ax, results: dict, keys: List[str], metric: str,
+                       mark_baseline: bool = True):
+    """Plot Yes-rate (%) vs K for ``keys`` on ``ax``; optionally mark the steered
+    factual-control baseline. Returns True if anything was drawn."""
+    drawn = False
+    for key in keys:
+        if key == "ablate_identification":
+            cdata = results["curves"].get(key)
+            mc = cdata.get("id_rate") if cdata else None
+        else:
+            cdata = results["curves"].get(key)
+            mc = cdata.get(metric) if cdata else None
+        if not mc:
+            continue
+        ks, ys = _ks_ys(mc)
+        label, color, marker = _DET_STYLE[key]
+        ax.plot(ks, [v * 100 for v in ys], marker=marker, color=color, label=label)
+        drawn = True
+    if mark_baseline:
+        _baseline_hline(ax, results, metric, scale=100)
+    ax.set_ylim(-5, 105)
+    ax.set_xlabel("K")
+    ax.set_ylabel("Yes rate (%)")
+    ax.grid(True, alpha=0.3)
+    return drawn
+
+
+def _overlay_logit_axis(ax, results: dict, keys: List[str], mark_baseline: bool = True):
+    """Plot raw Yes/No logsumexp vs K for ``keys`` on ``ax``; optionally mark the
+    steered factual-control Yes/No baselines."""
+    last_ks = None
+    for key in keys:
+        cdata = results["curves"].get(key)
+        if not cdata or not cdata.get("mean_yes_lse"):
+            continue
+        yk, yv = _ks_ys(cdata["mean_yes_lse"])
+        _, nv = _ks_ys(cdata["mean_no_lse"])
+        label, color, marker = _DET_STYLE[key]
+        ax.plot(yk, yv, marker=marker, color=color, ls="-", label=f"{label}: Yes")
+        ax.plot(yk, nv, marker=marker, color=color, ls=":", label=f"{label}: No")
+        last_ks = yk
+    if mark_baseline:
+        base = results.get("arith_steered_baseline")
+        if base:
+            if _is_num(base.get("mean_yes_lse")):
+                ax.axhline(base["mean_yes_lse"], color="0.25", ls="--", lw=1.2,
+                           label="Steered 2+2=5: Yes")
+            if _is_num(base.get("mean_no_lse")):
+                ax.axhline(base["mean_no_lse"], color="0.55", ls="--", lw=1.2,
+                           label="Steered 2+2=5: No")
+    if last_ks is not None:
+        _apply_k_xscale(ax, last_ks)
+    ax.set_xlabel("K")
+    ax.set_ylabel("logsumexp (nats)")
+    ax.grid(True, alpha=0.3)
+
+
+def plot_overlay_rates(results: dict, out_path: Path):
+    """Overlay the introspection and factual-control Yes-rates so the two can be
+    compared directly. Left: the patch comparison (concept knock-in vs the same
+    gates knocked into 2+2=5). Right: the revert comparison."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    metric = "detect_gap_rate"
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+    _overlay_rate_axis(axL, results, ["patch_detection", "patch_arithmetic_control"], metric)
+    axL.set_title("Patch: concept detection vs factual control")
+    axL.legend(fontsize=8, loc="best")
+
+    _overlay_rate_axis(axR, results,
+                       ["reverse_patch_detection", "ablate_arithmetic_control"], metric)
+    axR.set_title("Revert / ablate: concept detection vs factual control")
+    axR.legend(fontsize=8, loc="best")
+
+    cfg = results["config"]
+    fig.suptitle(f"Introspection vs factual-control Yes-rate (gap-based)\n"
+                 f"({cfg['setting']}, L={cfg['steering_layer']}, s={cfg['strength']})",
+                 fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[02] Saved plot -> {out_path}")
+
+
+def plot_overlay_logits(results: dict, out_path: Path):
+    """Overlay the introspection and factual-control raw Yes/No logits. Left: the
+    patch comparison; right: the revert/ablate comparison. The steered 2+2=5
+    Yes/No baselines are marked as horizontal lines."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+    _overlay_logit_axis(axL, results, ["patch_detection", "patch_arithmetic_control"])
+    axL.set_title("Patch: concept detection vs factual control")
+    axL.legend(fontsize=8, loc="best")
+
+    _overlay_logit_axis(axR, results,
+                        ["reverse_patch_detection", "ablate_arithmetic_control"])
+    axR.set_title("Revert / ablate: concept detection vs factual control")
+    axR.legend(fontsize=8, loc="best")
+
+    cfg = results["config"]
+    fig.suptitle(f"Introspection vs factual-control raw Yes/No logits\n"
+                 f"({cfg['setting']}, L={cfg['steering_layer']}, s={cfg['strength']})",
+                 fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[02] Saved plot -> {out_path}")
