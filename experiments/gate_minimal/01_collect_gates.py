@@ -219,11 +219,22 @@ def collect_setting(
     no_ids: List[int],
     n_top: int,
     output_dir: Path,
+    dla_metric: str = "steered",
 ) -> Dict:
-    """Run collection for one setting and save mean_acts + gate json."""
+    """Run collection for one setting and save mean_acts + gate json.
+
+    ``dla_metric`` chooses what activation weights the DLA ranking:
+      * ``steered`` (default): ``mean_act = steered`` — reproduces the original
+        ranking, dominated by always-on high-magnitude features.
+      * ``diff``: ``mean_act = unsteered - steered`` (the activation *drop*).
+        Combined with the No-writing decoder direction, the most-negative-DLA
+        selection then isolates **suppression** gates (No-writers that switch
+        off when the concept appears) instead of detector-type No-writers.
+    """
     assert setting in ("injection", "prefill")
     assert prefill_variant in ("append_user", "replace_assistant")
     assert detect_variant in ("strict", "vague")
+    assert dla_metric in ("steered", "diff")
     device = model_w.device
 
     # Phase A: one forward per sample, capturing answer-position pre-MLP-LN at
@@ -301,7 +312,10 @@ def collect_setting(
         mean_acts[L] = steered_feats
         mean_acts_unsteered[L] = unsteered_feats
 
-        dla = gl.compute_dla(tc, delta_u, steered_feats)
+        # DLA weighting: steered activation (original) or the activation drop
+        # (unsteered - steered) to target suppression gates directly.
+        dla_acts = steered_feats if dla_metric == "steered" else (unsteered_feats - steered_feats)
+        dla = gl.compute_dla(tc, delta_u, dla_acts)
         gate_ids = gl.top_gate_features(dla, n_top)
         per_layer_gates[L] = {
             "gate_ids": gate_ids,
@@ -335,6 +349,7 @@ def collect_setting(
             "n_extra_words": n_extra_words,
             "prefill_variant": prefill_variant,
             "detect_variant": detect_variant,
+            "dla_metric": dla_metric,
             "scan_layers": scan_layers,
             "concepts": list(concepts),
             "n_top": n_top,
@@ -409,6 +424,15 @@ def main():
         help="Sampling temperature for response preview generation (0 = greedy).",
     )
     p.add_argument("--n-top", type=int, default=200)
+    p.add_argument(
+        "--dla-metric",
+        choices=["steered", "diff"],
+        default="steered",
+        help="Activation weighting for the DLA ranking. 'steered' = original "
+             "(mean steered activation, dominated by always-on features); "
+             "'diff' = unsteered-steered activation drop, which targets "
+             "suppression gates (No-writers that switch off on the concept).",
+    )
     p.add_argument("--output-dir", "-od", default="analysis/gate_minimal")
     p.add_argument("--device", "-d", default="cuda")
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
@@ -439,6 +463,8 @@ def main():
             setting_tag = f"prefill-{args.prefill_variant}"
         if args.detect_variant != "strict":
             setting_tag = f"{setting_tag}_detect-{args.detect_variant}"
+        if args.dla_metric != "steered":
+            setting_tag = f"{setting_tag}_dla-{args.dla_metric}"
         out_dir = (
             Path(args.output_dir) / args.model
             / f"{setting_tag}_L{args.steering_layer}_s{args.strength}"
