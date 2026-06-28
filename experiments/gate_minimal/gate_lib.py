@@ -207,13 +207,24 @@ def load_or_build_concept_vectors(
 # Injection hook (mirrors model_utils steering_hook; all positions)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_injection_hook(steering_vec: torch.Tensor, strength: float):
-    """Add ``strength * steering_vec`` to a decoder layer's residual output at
-    all positions."""
+def make_injection_hook(steering_vec: torch.Tensor, strength: float, positions: str = "all"):
+    """Add ``strength * steering_vec`` to a decoder layer's residual output.
+
+    ``positions='all'`` (default) adds the vector at every sequence position
+    (matching model_utils steering); ``positions='last'`` adds it only at the
+    final (answer) token.
+    """
+    if positions not in ("all", "last"):
+        raise ValueError(f"positions must be 'all' or 'last', got {positions!r}")
+
     def hook(module, args, output):
         out = output[0] if isinstance(output, tuple) else output
         vec = steering_vec.to(out.device, out.dtype) * float(strength)
-        modified = out + vec.view(1, 1, -1)
+        if positions == "all":
+            modified = out + vec.view(1, 1, -1)
+        else:
+            modified = out.clone()
+            modified[:, -1, :] = modified[:, -1, :] + vec.view(-1)
         if isinstance(output, tuple):
             return (modified,) + output[1:]
         return modified
@@ -314,6 +325,62 @@ def top_gate_features(dla: torch.Tensor, n_top: int = 200) -> List[int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Evidence-carrier discovery (virtual weights & gradient attribution)
+#
+# An *evidence carrier* is an upstream transcoder feature whose decoded write
+# pushes a downstream gate feature's encoder *down* while the concept is active,
+# i.e. it has **negative attribution** to the gate. This mirrors
+# 09b_causal_pathway.py: ``attribution = virtual_weight x activation`` with
+#   virtual_weight = dot(gate_encoder, candidate_decoder)
+#   activation     = the candidate's (steered) last-token feature activation.
+# (In that script the variable named ``suppressors`` — attribution < 0 — is the
+# evidence-carrier set; ``supporters`` — attribution > 0 — are amplifiers.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gate_encoder_vector(transcoder: JumpReLUSAE, gate_feat_id: int) -> torch.Tensor:
+    """Encoder row for a gate feature: ``w_enc.T[gate_feat_id]`` -> [d_model] fp32 CPU.
+
+    This is the direction the gate feature reads from the residual stream; an
+    upstream feature contributes to the gate in proportion to how much its
+    decoder write aligns with this vector.
+    """
+    w_enc = transcoder.w_enc.detach().float().cpu()  # [d_model, F]
+    return w_enc[:, int(gate_feat_id)].contiguous()  # [d_model]
+
+
+def virtual_weights(
+    transcoder: JumpReLUSAE,
+    gate_encoder: torch.Tensor,
+    feat_ids: Sequence[int],
+) -> torch.Tensor:
+    """vw(f) = dot(gate_encoder, decoder[f]) for each f in ``feat_ids``.
+
+    Returns fp32 CPU [len(feat_ids)] ordered exactly like ``feat_ids``. The
+    candidate ``transcoder`` and the gate transcoder may live on different
+    layers; only the candidate decoder rows and the gate encoder vector matter.
+    """
+    ids = torch.tensor([int(f) for f in feat_ids], dtype=torch.long)
+    w_dec = transcoder.w_dec.detach().float().cpu()      # [F, d_model]
+    dec_sel = w_dec.index_select(0, ids)                 # [k, d_model]
+    return dec_sel @ gate_encoder.float().cpu()          # [k]
+
+
+def split_carriers(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """Split attribution ``records`` into (evidence_carriers, amplifiers).
+
+    Each record must carry an ``"attribution"`` float. Evidence carriers
+    (attribution < 0) are sorted most-negative-first; amplifiers
+    (attribution > 0) are sorted most-positive-first. Zero-attribution records
+    are dropped (they neither carry nor amplify).
+    """
+    carriers = sorted([r for r in records if r["attribution"] < 0],
+                      key=lambda r: r["attribution"])           # most negative first
+    amplifiers = sorted([r for r in records if r["attribution"] > 0],
+                        key=lambda r: -r["attribution"])         # most positive first
+    return carriers, amplifiers
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Causal feature ablation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -357,6 +424,16 @@ class FeatureSlice:
         """
         x = pre_ln[0, -1, :].to(self.w_enc_sel.device, self.w_enc_sel.dtype)
         pre = x @ self.w_enc_sel + self.b_enc_sel
+        mask = pre > self.thr_sel
+        return (mask * torch.nn.functional.relu(pre)).float().cpu()
+
+    @torch.no_grad()
+    def encode_all_tokens(self, pre_ln: torch.Tensor) -> torch.Tensor:
+        """Encode every position's pre-LN activation through the slice only.
+        Returns ``[seq, k]`` (fp32 CPU), columns ordered like ``feature_ids``.
+        """
+        x = pre_ln[0].to(self.w_enc_sel.device, self.w_enc_sel.dtype)   # [seq, d]
+        pre = x @ self.w_enc_sel + self.b_enc_sel                        # [seq, k]
         mask = pre > self.thr_sel
         return (mask * torch.nn.functional.relu(pre)).float().cpu()
 
@@ -434,13 +511,20 @@ class GateAblation:
 
 
 class GatePatch:
-    """Context manager that patches selected features' last-token activations to
-    their steered values inside an *unsteered* forward pass (knock-in).
+    """Context manager that forces selected features' activations to a target
+    value (``steered_sel``) by writing ``(steered_sel - current_sel) @ w_dec_sel``
+    into the layer's residual output.
 
-    At the answer position it adds ``(steered_sel - unsteered_sel) @ w_dec_sel``
-    to the layer's residual output, so the gate features carry their steered
-    activation while everything else stays unsteered. ``steered_sel`` must be
-    ordered like the slice's ``feature_ids``.
+    The target ``steered_sel`` must be ordered like the slice's ``feature_ids``.
+    Two scopes:
+
+    * ``positions='last'`` (default): edit only the answer token; ``steered_sel``
+      has shape ``[k]``. Used as a *knock-in* (force features to their steered
+      value inside an unsteered forward) or, by passing the unsteered/control
+      activations as the target, as a last-token *replace-with-unsteered* ablation.
+    * ``positions='all'``: edit every position; ``steered_sel`` has shape
+      ``[seq, k]`` (one target row per position) and ``seq`` must match the
+      running forward's sequence length.
     """
 
     def __init__(
@@ -450,10 +534,13 @@ class GatePatch:
         transcoder_or_steered=None,
         feature_ids: Optional[Sequence[int]] = None,
         steered_sel: Optional[torch.Tensor] = None,
+        positions: str = "last",
     ):
         # Two construction modes:
         #   GatePatch(model_w, feature_slice, steered_sel=...)
         #   GatePatch(model_w, layer_idx, transcoder, feature_ids, steered_sel=...)
+        if positions not in ("last", "all"):
+            raise ValueError(f"positions must be 'last' or 'all', got {positions!r}")
         if isinstance(slice_or_layer, FeatureSlice):
             self._slice = slice_or_layer
             assert steered_sel is None or transcoder_or_steered is None, \
@@ -466,6 +553,7 @@ class GatePatch:
             self._slice = FeatureSlice.from_transcoder(int(slice_or_layer), transcoder_or_steered, feature_ids)
             steered = steered_sel
         self.model_w = model_w
+        self.positions = positions
         self.layer_idx = self._slice.layer_idx
         self.feature_ids = self._slice.feature_ids
         self._handles: List = []
@@ -474,12 +562,25 @@ class GatePatch:
 
     def _pre_ln_hook(self, module, args, output):
         out = output[0] if isinstance(output, tuple) else output
-        x = out[0, -1, :].to(self._slice.w_enc_sel.dtype)                # [d]
-        pre = x @ self._slice.w_enc_sel + self._slice.b_enc_sel          # [k]
-        mask = pre > self._slice.thr_sel
-        unsteered_sel = mask * torch.nn.functional.relu(pre)
-        delta = self._steered_sel - unsteered_sel                        # [k]
-        self._contribution["c"] = (delta @ self._slice.w_dec_sel).detach()  # [d]
+        if self.positions == "last":
+            x = out[0, -1, :].to(self._slice.w_enc_sel.dtype)                # [d]
+            pre = x @ self._slice.w_enc_sel + self._slice.b_enc_sel          # [k]
+            mask = pre > self._slice.thr_sel
+            current_sel = mask * torch.nn.functional.relu(pre)
+            delta = self._steered_sel - current_sel                          # [k]
+            self._contribution["c"] = (delta @ self._slice.w_dec_sel).detach()  # [d]
+        else:
+            x = out[0].to(self._slice.w_enc_sel.dtype)                       # [seq, d]
+            pre = x @ self._slice.w_enc_sel + self._slice.b_enc_sel          # [seq, k]
+            mask = pre > self._slice.thr_sel
+            current_sel = mask * torch.nn.functional.relu(pre)               # [seq, k]
+            if self._steered_sel.shape[0] != current_sel.shape[0]:
+                raise ValueError(
+                    f"GatePatch positions='all' target seq {self._steered_sel.shape[0]} "
+                    f"!= forward seq {current_sel.shape[0]}"
+                )
+            delta = self._steered_sel - current_sel                          # [seq, k]
+            self._contribution["c"] = (delta @ self._slice.w_dec_sel).detach()  # [seq, d]
 
     def _layer_out_hook(self, module, args, output):
         out = output[0] if isinstance(output, tuple) else output
@@ -487,7 +588,10 @@ class GatePatch:
         if c is None:
             return output
         modified = out.clone()
-        modified[:, -1, :] = modified[:, -1, :] + c.to(out.device, out.dtype)
+        if self.positions == "last":
+            modified[:, -1, :] = modified[:, -1, :] + c.to(out.device, out.dtype)
+        else:
+            modified[:, :, :] = modified[:, :, :] + c.to(out.device, out.dtype).unsqueeze(0)
         if isinstance(output, tuple):
             return (modified,) + output[1:]
         return modified
