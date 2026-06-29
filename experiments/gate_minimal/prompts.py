@@ -190,16 +190,27 @@ def format_forced_identification_prompt(
 ) -> torch.Tensor:
     """Return input_ids [1, seq] for the forced-identification prompt.
 
-    Uses the ``identify`` trial template so the question explicitly asks for
-    the word; the affirmative prefill is then appended after the generation
-    prompt so the final-position logits predict the concept word's first token.
+    Uses the open-ended ``vague`` question ("Do you detect an injected thought?
+    If so, what is the injected thought about?") — verbatim the validated
+    forced-identification prompt from experiment 13
+    (``13_component_attribution.format_forced_messages``). The affirmative
+    prefill is then appended after the generation prompt so the final-position
+    logits predict the concept word's first token.
+
+    NOTE: the ``identify`` template (which appends "Begin your answer with
+    'Yes' or 'No'.") is deliberately *not* used here. That instruction biases
+    the model toward a terse binary Yes/No answer, suppressing the descriptive
+    continuation and artificially depressing the identification rate. Since the
+    forced prefill already supplies the affirmative "Yes, I detect ...", the
+    open-ended question is both more natural and matches the reference pipeline.
     """
     msgs = build_messages(
         trial_n,
         prefill_word,
         n_extra_words,
-        mode="identify",
+        mode="detect",
         prefill_variant=prefill_variant,
+        detect_variant="vague",
     )
     formatted = tokenizer.apply_chat_template(
         msgs, tokenize=False, add_generation_prompt=True
@@ -264,6 +275,30 @@ def concept_first_token_id(tokenizer, concept: str) -> int:
     prefill (which ends with an opening quote, so no leading space)."""
     ids = tokenizer.encode(concept, add_special_tokens=False)
     return ids[0]
+
+
+def concept_first_token_ids(tokenizer, concept: str) -> List[int]:
+    """All acceptable first-token ids for the concept after the forced prefill,
+    treating case as equivalent.
+
+    The prefill ends with an opening quote, so the model may capitalize the word
+    ("Bread") or lower-case it ("bread") depending on its own formatting habit;
+    both name the same concept. We therefore accept the first token of several
+    surface forms — as-written, capitalized, lower-cased, and upper-cased — so
+    a pure case difference is not scored as an identification miss.
+    """
+    forms = {
+        concept,
+        concept.capitalize(),
+        concept.lower(),
+        concept.upper(),
+    }
+    ids = set()
+    for form in forms:
+        enc = tokenizer.encode(form, add_special_tokens=False)
+        if enc:
+            ids.add(enc[0])
+    return sorted(ids)
 
 
 def logit_gap(logits: torch.Tensor, yes_ids: List[int], no_ids: List[int]) -> torch.Tensor:

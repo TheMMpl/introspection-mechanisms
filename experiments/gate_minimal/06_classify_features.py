@@ -148,6 +148,7 @@ def classify_gates(
     exact_decode: Optional[Dict[int, Dict[int, float]]] = None,
     decode_override: Optional[Dict[tuple, Optional[float]]] = None,
     top_k: Optional[int] = None,
+    allowed_layers: Optional[set] = None,
 ) -> List[dict]:
     S = {int(L): t for L, t in mean_acts["steered"].items()}
     U = {int(L): t for L, t in mean_acts["unsteered"].items()}
@@ -160,6 +161,10 @@ def classify_gates(
     records: List[dict] = []
     for rec in pool:
         L = int(rec["layer"]); f = int(rec["feature_id"]); dla = float(rec["dla"])
+        # Skip gates whose layer is outside the requested range (e.g. the
+        # overlapping layers when comparing two runs with different scans).
+        if allowed_layers is not None and L not in allowed_layers:
+            continue
         s = float(S[L][f]); u = float(U[L][f])
         if decode_override is not None:
             dp = decode_override.get((L, f))
@@ -375,10 +380,28 @@ def process(gates_json: Path, act_eps: float, rel_eps: float,
                 continue
             cross_acts = torch.load(cross_acts_path, map_location="cpu",
                                     weights_only=False)
+            # The cross run may have scanned a different layer range; restrict
+            # the comparison to layers present in BOTH settings so neither side
+            # references a missing layer.
+            home_layers = {int(L) for L in mean_acts["steered"].keys()}
+            cross_layers = {int(L) for L in cross_acts["steered"].keys()}
+            overlap_layers = home_layers & cross_layers
+            missing = sorted(home_layers - cross_layers)
+            if missing:
+                print(f"[06] cross {cdir.name}: layer ranges differ; "
+                      f"restricting to {len(overlap_layers)} shared layers "
+                      f"[{min(overlap_layers)}..{max(overlap_layers)}]; "
+                      f"home-only layers skipped: {missing}")
             cross_records = classify_gates(
                 gates, cross_acts, act_eps, rel_eps,
-                decode_override=decode_override, top_k=top_k)
-            comparison = compare_classifications(records, cross_records)
+                decode_override=decode_override, top_k=top_k,
+                allowed_layers=overlap_layers)
+            # Pair against the home records restricted to the same overlap so the
+            # side-by-side counts and transitions cover an identical gate set.
+            home_overlap = [r for r in records if r["layer"] in overlap_layers]
+            comparison = compare_classifications(home_overlap, cross_records)
+            comparison["overlap_layers"] = sorted(overlap_layers)
+            comparison["home_only_layers"] = missing
 
             cname = cdir.name
             cross_out = out_dir / f"cross_{cname}"
@@ -390,6 +413,9 @@ def process(gates_json: Path, act_eps: float, rel_eps: float,
             with open(cross_out / "comparison.json", "w") as f:
                 json.dump(comparison, f, indent=2)
             cnote = f"home: {gates_json.parent.name}  ->  cross: {cname}"
+            if missing:
+                cnote += (f"\nshared layers {min(overlap_layers)}-{max(overlap_layers)} "
+                          f"({len(home_overlap)} of {len(records)} gates)")
             plot_cross_compare(comparison, cross_out / "cross_compare.png", cnote)
 
             frac = comparison["frac_same_class"]

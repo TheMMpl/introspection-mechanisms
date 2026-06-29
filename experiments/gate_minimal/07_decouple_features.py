@@ -274,7 +274,7 @@ def main():
     }
 
     arith_ids = P.format_arithmetic_control_prompt(tokenizer, args.arithmetic_question)
-    concept_tok = {c: P.concept_first_token_id(tokenizer, c) for c in concepts}
+    concept_tok = {c: set(P.concept_first_token_ids(tokenizer, c)) for c in concepts}
 
     for k in k_grid:
         cond_layerfeats = {
@@ -325,7 +325,7 @@ def main():
                     sums["rev_yes"][c] += rd["yes_lse"]
                     sums["rev_no"][c] += rd["no_lse"]
                     li = reverted_logits(id_ids, base_id_ids, ls, concept)
-                    if int(li.argmax(dim=-1).item()) == concept_tok[concept]:
+                    if int(li.argmax(dim=-1).item()) in concept_tok[concept]:
                         id_hits[c] += 1
                     # patch: unsteered run, class gates -> steered. Capture the
                     # steered detection gates once and reuse for the control.
@@ -339,7 +339,7 @@ def main():
                     sums["pat_yes"][c] += prd["yes_lse"]
                     sums["pat_no"][c] += prd["no_lse"]
                     pli = patched_logits(base_id_ids, id_ids, ls, concept)
-                    if int(pli.argmax(dim=-1).item()) == concept_tok[concept]:
+                    if int(pli.argmax(dim=-1).item()) in concept_tok[concept]:
                         pid_hits[c] += 1
                     # control: 2+2=5 with the steered detection gates patched in.
                     ca = patch_with_sel(arith_ids, steered_det_sel, ls)

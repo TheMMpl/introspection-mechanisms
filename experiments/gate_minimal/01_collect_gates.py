@@ -507,6 +507,7 @@ def main():
             no_ids=no_ids,
             n_top=args.n_top,
             output_dir=out_dir,
+            dla_metric=args.dla_metric,
         )
 
 

@@ -119,6 +119,66 @@ def _aggregate_records(recs: List[dict]) -> dict:
     }
 
 
+def preview_forced_identification(
+    model_w,
+    tokenizer,
+    concepts,
+    concept_tok,
+    prefill_word,
+    injection_handle,
+    n_trials: int,
+    n_extra_words: int,
+    prefill_variant: str,
+    max_new_tokens: int = 8,
+):
+    """Greedily generate the forced-identification continuation for each concept
+    (no gate ablation, K=0 baseline) and print it.
+
+    Lets you eyeball whether the prompt naturally elicits the concept word after
+    the affirmative prefill ('...The injected word is **"'). The reported
+    ``argmax-hit`` flag matches the metric used by the ``revert_identification``
+    curve: True iff the very first generated token is one of the concept's
+    accepted first-token ids (``concept_tok``, case-insensitive).
+    """
+    print(f"\n[02][preview] Forced-identification continuations "
+          f"(setting prefill_variant={prefill_variant}, "
+          f"max_new_tokens={max_new_tokens}, n_trials={n_trials})\n")
+    hits = 0
+    total = 0
+    for concept in concepts:
+        for trial in range(1, n_trials + 1):
+            id_ids = P.format_forced_identification_prompt(
+                tokenizer,
+                trial,
+                prefill_word(concept),
+                n_extra_words,
+                prefill_variant=prefill_variant,
+            )
+            h = injection_handle(concept)
+            try:
+                with torch.no_grad():
+                    out = model_w.model.generate(
+                        input_ids=id_ids.to(model_w.device),
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+            finally:
+                if h is not None:
+                    h.remove()
+            gen_ids = out[0, id_ids.shape[1]:]
+            first_tok = int(gen_ids[0].item()) if gen_ids.numel() else -1
+            hit = first_tok in concept_tok[concept]
+            hits += int(hit)
+            total += 1
+            cont = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            flag = "OK " if hit else "miss"
+            print(f"  [{flag}] {concept:>12} | t{trial}: \u2026**\"{cont}")
+    rate = hits / total if total else float("nan")
+    print(f"\n[02][preview] argmax-hit rate (first token == concept first token): "
+          f"{hits}/{total} = {rate:.2%}\n")
+
+
 def main():
     p = argparse.ArgumentParser(description="Progressive gate ablation (Fig 11c-style).")
     p.add_argument("--model", "-m", default="gemma3_27b")
@@ -148,6 +208,12 @@ def main():
              "Default: read from gates.json if present.",
     )
     p.add_argument("--curves", nargs="+", default=ALL_CURVES, choices=ALL_CURVES)
+    p.add_argument("--preview", action="store_true",
+                   help="Generate and print the forced-identification continuations "
+                        "(no gate ablation) for each concept, then exit. Use to sanity-"
+                        "check that the prompt naturally elicits the concept word.")
+    p.add_argument("--preview-tokens", type=int, default=8,
+                   help="Number of tokens to greedily generate in --preview mode.")
     p.add_argument("--arithmetic-question", default=P.ARITHMETIC_CONTROL,
                    help="Factual control question (default: introspection_gemma's).")
     p.add_argument("--output-dir", "-od", default=None,
@@ -193,7 +259,7 @@ def main():
             model_w, concepts, steering_layer, vec_cache
         )
 
-    concept_tok = {c: P.concept_first_token_id(tokenizer, c) for c in concepts}
+    concept_tok = {c: set(P.concept_first_token_ids(tokenizer, c)) for c in concepts}
 
     def injection_handle(concept):
         if args.setting != "injection":
@@ -203,6 +269,17 @@ def main():
 
     def prefill_word(concept):
         return concept if args.setting == "prefill" else None
+
+    if args.preview:
+        preview_forced_identification(
+            model_w, tokenizer, concepts, concept_tok,
+            prefill_word, injection_handle,
+            n_trials=args.n_trials,
+            n_extra_words=args.n_extra_words,
+            prefill_variant=prefill_variant,
+            max_new_tokens=args.preview_tokens,
+        )
+        return
 
     def ablated_logits(input_ids, slices, involved, concept_for_injection=None):
         """Forward with the top-K gates ablated; optional injection hook."""
@@ -315,7 +392,7 @@ def main():
                         finally:
                             if h is not None:
                                 h.remove()
-                    id_acc.append(int(logits_id.argmax(dim=-1).item()) == concept_tok[concept])
+                    id_acc.append(int(logits_id.argmax(dim=-1).item()) in concept_tok[concept])
 
                 # patch: steered → unsteered knock-in
                 if "patch_detection" in det_curves:
